@@ -432,9 +432,10 @@ func (dt *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	return resp, nil
 }
+
 var (
-	ErrPoolClosed = errors.New("tri client pool is closed")
-	ErrTimeout    = errors.New("tri client pool get timeout")
+	ErrTriClientPoolClosed  = errors.New("tri client pool is closed")
+	ErrTriClientPoolTimeout = errors.New("tri client pool get timeout")
 )
 
 type TriClientPool struct {
@@ -446,7 +447,7 @@ type TriClientPool struct {
 	closed      bool
 	getTimeouts int // recent timeout count, used to trigger expansion
 
-	fallback	*tri.Client
+	fallback *tri.Client
 }
 
 func NewTriClientPool(maxSize int, factory func() *tri.Client) *TriClientPool {
@@ -477,7 +478,7 @@ func (p *TriClientPool) Get(timeout time.Duration) (*tri.Client, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return nil, ErrPoolClosed
+		return nil, ErrTriClientPoolClosed
 	}
 	// try to expand
 	if p.curSize < p.maxSize {
@@ -491,7 +492,7 @@ func (p *TriClientPool) Get(timeout time.Duration) (*tri.Client, error) {
 	select {
 	case cli, ok := <-p.clients:
 		if !ok {
-			return nil, ErrPoolClosed
+			return nil, ErrTriClientPoolClosed
 		}
 		return cli, nil
 	case <-time.After(timeout):
@@ -501,7 +502,7 @@ func (p *TriClientPool) Get(timeout time.Duration) (*tri.Client, error) {
 			p.fallback = p.factory()
 		}
 		p.mu.Unlock()
-		return p.fallback, ErrTimeout
+		return p.fallback, ErrTriClientPoolTimeout
 	}
 }
 
@@ -640,7 +641,7 @@ func checkExpand(curSize, idle, timeouts int) int {
 		return expand
 	}
 
-	if idle < curSize / 5 {
+	if idle < curSize/5 {
 		return 1
 	}
 
