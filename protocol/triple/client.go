@@ -312,18 +312,18 @@ func newClientManager(url *common.URL) (*clientManager, error) {
 		baseTriURL = httpPrefix + baseTriURL
 	}
 
-	triPools := make(map[string]*TriClientPool)
+	triClientPools := make(map[string]*TriClientPool)
 
 	if len(url.Methods) != 0 {
 		for _, method := range url.Methods {
 			triURL, err := joinPath(baseTriURL, url.Interface(), method)
 			if err != nil {
-				return nil, fmt.Errorf("failed to join path for method %s: %w", method, err)
+				return nil, fmt.Errorf("JoinPath failed for base %s, interface %s, method %s", baseTriURL, url.Interface(), method)
 			}
 			pool := NewTriClientPool(triClientPoolMaxSize, func() *tri.Client {
 				return tri.NewClient(httpClient, triURL, cliOpts...)
 			})
-			triPools[method] = pool
+			triClientPools[method] = pool
 		}
 	} else {
 		// This branch is for the non-IDL mode, where we pass in the service solely
@@ -336,21 +336,21 @@ func newClientManager(url *common.URL) (*clientManager, error) {
 
 		serviceType := reflect.TypeOf(service)
 		for i := range serviceType.NumMethod() {
-			method := serviceType.Method(i).Name
-			triURL, err := joinPath(baseTriURL, url.Interface(), method)
+			methodName := serviceType.Method(i).Name
+			triURL, err := joinPath(baseTriURL, url.Interface(), methodName)
 			if err != nil {
-				return nil, fmt.Errorf("failed to join path for method %s: %w", method, err)
+				return nil, fmt.Errorf("JoinPath failed for base %s, interface %s, method %s", baseTriURL, url.Interface(), methodName)
 			}
 			pool := NewTriClientPool(triClientPoolMaxSize, func() *tri.Client {
 				return tri.NewClient(httpClient, triURL, cliOpts...)
 			})
-			triPools[method] = pool
+			triClientPools[methodName] = pool
 		}
 	}
 
 	return &clientManager{
 		isIDL:      isIDL,
-		triClients: triPools,
+		triClients: triClientPools,
 	}, nil
 }
 

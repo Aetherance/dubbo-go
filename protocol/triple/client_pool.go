@@ -43,22 +43,26 @@ var (
 )
 
 const (
-	autoScalerPeriod        = 700 * time.Millisecond // autoScaler interval
-	maxExpandPerCycle       = 16                     // maximum number of clients to expand per cycle
-	lowIdleThresholdDivisor = 5                      // consider clients insufficient if idle < curSize/5
-	highIdleStreakLimit     = 10                     // consecutive high idle count to trigger shrinking
+	autoScalerPeriod    = 700 * time.Millisecond // minimum period that autoScaler expand or shrink
+	maxExpandPerCycle   = 16                     // maximum number of clients to expand per cycle
+	highIdleStreakLimit = 10                     // consecutive high idle count to trigger shrinking
+	lowIdleThreshold    = 0.2                    // treat pool as busy if idle clients < 20% of total
+	idleShrinkThreshold = 0.6                    // shrink counter increases when idle ratio > 60%
+	shrinkRatio         = 0.125                  // shrink by 12.5% of current size when threshold is reached
 )
 
 type TriClientPool struct {
-	clients     chan *tri.Client
-	factory     func() *tri.Client
-	mu          sync.Mutex
-	maxSize     int
-	curSize     int
-	closed      bool
-	getTimeouts int // recent timeout count, used to trigger expansion
+	clients       chan *tri.Client
+	factory       func() *tri.Client
+	mu            sync.Mutex
+	maxSize       int
+	curSize       int
+	closed        bool
+	getTimeouts   int // recent timeout count, used to trigger expansion
+	lastScaleTime time.Time
 
-	fallback *tri.Client
+	fallback            *tri.Client
+	consecutiveHighIdle int
 }
 
 func NewTriClientPool(maxSize int, factory func() *tri.Client) *TriClientPool {
@@ -67,7 +71,6 @@ func NewTriClientPool(maxSize int, factory func() *tri.Client) *TriClientPool {
 		factory: factory,
 		maxSize: maxSize,
 	}
-	go pool.autoScaler()
 	return pool
 }
 
@@ -80,6 +83,11 @@ func NewTriClientPool(maxSize int, factory func() *tri.Client) *TriClientPool {
 // If expansion is not allowed, it waits for a client up to timeout.
 // After timeout, if still no client, Get() returns ErrTimeout with fallback.
 func (p *TriClientPool) Get(timeout time.Duration) (*tri.Client, error) {
+	now := time.Now()
+	if now.Sub(p.lastScaleTime) > autoScalerPeriod {
+		p.autoScaler()
+	}
+
 	select {
 	case cli := <-p.clients:
 		return cli, nil
@@ -122,6 +130,11 @@ func (p *TriClientPool) Get(timeout time.Duration) (*tri.Client, error) {
 // If it fails, Put will drop the client and notify the pool.
 // Dropping a client is part of shrinking.
 func (p *TriClientPool) Put(c *tri.Client) {
+	now := time.Now()
+	if now.Sub(p.lastScaleTime) > autoScalerPeriod {
+		p.autoScaler()
+	}
+
 	if c == nil {
 		return
 	}
@@ -168,38 +181,40 @@ func (p *TriClientPool) Closed() bool {
 	return p.closed
 }
 
-// autoScaler is the main worker that adjusts pool size.
-// It checks regularly whether pool should expand or shrink.
+// autoScaler performs scaling check.
+// It is triggered by Get() or Put()
 // If the timeout count is high, autoScaler tends to expand.
 // If the idle client count is often high, autoScaler tends to shrink.
 func (p *TriClientPool) autoScaler() {
-	ticker := time.NewTicker(autoScalerPeriod)
-	defer ticker.Stop()
-	consecutiveHighIdle := 0
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	for range ticker.C {
-		if p.Closed() {
-			return
-		}
+	now := time.Now()
+	if now.Sub(p.lastScaleTime) < autoScalerPeriod {
+		return
+	}
 
-		p.mu.Lock()
-		curSize := p.curSize
-		idle := len(p.clients)
-		timeouts := p.getTimeouts
-		p.getTimeouts = 0
-		p.mu.Unlock()
+	if p.closed {
+		return
+	}
 
-		needExpand := checkExpand(curSize, idle, timeouts)
-		if needExpand != 0 {
-			p.expand(needExpand)
-			consecutiveHighIdle = 0
-			continue
-		}
+	p.lastScaleTime = now
 
-		needShrink := checkShrink(curSize, idle, &consecutiveHighIdle)
-		if needShrink != 0 {
-			p.shrink(needShrink)
-		}
+	curSize := p.curSize
+	idle := len(p.clients)
+	timeouts := p.getTimeouts
+	p.getTimeouts = 0
+
+	needExpand := checkExpand(curSize, idle, timeouts)
+	if needExpand != 0 {
+		p.expand(needExpand)
+		p.consecutiveHighIdle = 0
+		return
+	}
+
+	needShrink := checkShrink(curSize, idle, &p.consecutiveHighIdle)
+	if needShrink != 0 {
+		p.shrink(needShrink)
 	}
 }
 
@@ -242,7 +257,7 @@ func (p *TriClientPool) recordTimeout() {
 
 // compute expansion size
 // expansion size is based on timeout count: 2 ^ timeouts
-// if idle clients are less than 1/lowIdleThresholdDivisor of total, treat as busy and expand slightly
+// if idle clients are less than lowIdleThreshold * total, treat as busy and expand slightly
 func checkExpand(curSize, idle, timeouts int) int {
 	if timeouts > 0 {
 		expand := 1 << timeouts
@@ -252,7 +267,7 @@ func checkExpand(curSize, idle, timeouts int) int {
 		return expand
 	}
 
-	if idle < curSize/lowIdleThresholdDivisor {
+	if idle < int(float64(curSize)*lowIdleThreshold) {
 		return 1
 	}
 
@@ -261,12 +276,12 @@ func checkExpand(curSize, idle, timeouts int) int {
 
 // if more than 60% of clients are idle, increase highIdleStreak
 // highIdleStreak records how often idle rate is high
-// if highIdleStreak >= highIdleStreakLimit, shrink pool to 1/8
+// if highIdleStreak >= highIdleStreakLimit, shrink pool to idleShrinkThreshold of the pool
 func checkShrink(curSize int, idle int, highIdleStreak *int) int {
-	if idle > curSize*6/10 {
+	if idle > int(float64(curSize)*idleShrinkThreshold) {
 		*highIdleStreak++
 		if *highIdleStreak >= highIdleStreakLimit {
-			shrink := curSize / 8
+			shrink := int(float64(curSize) * shrinkRatio)
 			if shrink < 1 {
 				shrink = 1
 			}
