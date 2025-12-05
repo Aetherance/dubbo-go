@@ -59,18 +59,32 @@ const (
 type clientManager struct {
 	isIDL bool
 	// triple_protocol clients, key is method name
-	triClients map[string]*tri.Client
+	triClients map[string]*TriClientPool
 }
 
 // TODO: code a triple client between clientManager and triple_protocol client
 // TODO: write a NewClient for triple client
 
 func (cm *clientManager) getClient(method string) (*tri.Client, error) {
-	triClient, ok := cm.triClients[method]
-	if !ok {
+	// Wait up to defaultClientGetTimeout for a pooled client; if none becomes available we return the
+	// fallback client and record a timeout which is used to drive autoscaling.
+	triClient, err := cm.triClients[method].Get(constant.DefaultClientGetTimeout)
+	if err != nil {
 		return nil, fmt.Errorf("missing triple client for method: %s", method)
 	}
 	return triClient, nil
+}
+
+func (cm *clientManager) putClient(method string, c *tri.Client) {
+	if c == nil {
+		return
+	}
+	pool, ok := cm.triClients[method]
+	if !ok {
+		logger.Warnf("no client pool found for method %s, dropping client", method)
+		return
+	}
+	pool.Put(c)
 }
 
 func (cm *clientManager) callUnary(ctx context.Context, method string, req, resp any) error {
@@ -78,6 +92,7 @@ func (cm *clientManager) callUnary(ctx context.Context, method string, req, resp
 	if err != nil {
 		return err
 	}
+	defer cm.putClient(method, triClient)
 	triReq := tri.NewRequest(req)
 	triResp := tri.NewResponse(resp)
 	if err := triClient.CallUnary(ctx, triReq, triResp); err != nil {
@@ -91,6 +106,7 @@ func (cm *clientManager) callClientStream(ctx context.Context, method string) (a
 	if err != nil {
 		return nil, err
 	}
+	defer cm.putClient(method, triClient)
 	stream, err := triClient.CallClientStream(ctx)
 	if err != nil {
 		return nil, err
@@ -103,6 +119,7 @@ func (cm *clientManager) callServerStream(ctx context.Context, method string, re
 	if err != nil {
 		return nil, err
 	}
+	defer cm.putClient(method, triClient)
 	triReq := tri.NewRequest(req)
 	stream, err := triClient.CallServerStream(ctx, triReq)
 	if err != nil {
@@ -116,6 +133,7 @@ func (cm *clientManager) callBidiStream(ctx context.Context, method string) (any
 	if err != nil {
 		return nil, err
 	}
+	defer cm.putClient(method, triClient)
 	stream, err := triClient.CallBidiStream(ctx)
 	if err != nil {
 		return nil, err
@@ -124,8 +142,16 @@ func (cm *clientManager) callBidiStream(ctx context.Context, method string) (any
 }
 
 func (cm *clientManager) close() error {
-	// There is no need to release resources right now.
-	// But we leave this function here for future use.
+	if cm.triClients == nil {
+		return ErrTriClientPoolCloseWhenEmpty
+	}
+	for _, pool := range cm.triClients {
+		if pool != nil {
+			pool.Close()
+		}
+	}
+	cm.triClients = nil
+
 	return nil
 }
 
@@ -282,7 +308,7 @@ func newClientManager(url *common.URL) (*clientManager, error) {
 		baseTriURL = httpPrefix + baseTriURL
 	}
 
-	triClients := make(map[string]*tri.Client)
+	triClientPools := make(map[string]*TriClientPool)
 
 	if len(url.Methods) != 0 {
 		for _, method := range url.Methods {
@@ -290,8 +316,10 @@ func newClientManager(url *common.URL) (*clientManager, error) {
 			if err != nil {
 				return nil, fmt.Errorf("JoinPath failed for base %s, interface %s, method %s", baseTriURL, url.Interface(), method)
 			}
-			triClient := tri.NewClient(httpClient, triURL, cliOpts...)
-			triClients[method] = triClient
+			pool := NewTriClientPool(constant.DefaultClientWarmingUp, constant.TriClientPoolMaxSize, func() *tri.Client {
+				return tri.NewClient(httpClient, triURL, cliOpts...)
+			})
+			triClientPools[method] = pool
 		}
 	} else {
 		// This branch is for the non-IDL mode, where we pass in the service solely
@@ -309,14 +337,16 @@ func newClientManager(url *common.URL) (*clientManager, error) {
 			if err != nil {
 				return nil, fmt.Errorf("JoinPath failed for base %s, interface %s, method %s", baseTriURL, url.Interface(), methodName)
 			}
-			triClient := tri.NewClient(httpClient, triURL, cliOpts...)
-			triClients[methodName] = triClient
+			pool := NewTriClientPool(constant.DefaultClientWarmingUp, constant.TriClientPoolMaxSize, func() *tri.Client {
+				return tri.NewClient(httpClient, triURL, cliOpts...)
+			})
+			triClientPools[methodName] = pool
 		}
 	}
 
 	return &clientManager{
 		isIDL:      isIDL,
-		triClients: triClients,
+		triClients: triClientPools,
 	}, nil
 }
 
